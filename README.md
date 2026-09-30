@@ -1,23 +1,34 @@
-Two-Stage Startup Architecture:
+# ⚡ ZygoteRS
 
-Stage 1 (Reversible & Side-Effect Free): Command-line arguments, environment parameters, and system properties are validated in a completely safe, read-only phase. Any parsing error, unknown configuration, or edge-case safely returns APP_PROCESS_RS_DECLINED to fall back to the legacy C++ execution path without touching system state.
+**A High-Safety, Zero-Panic Rust Startup Engine for Android's `app_process` & Zygote**
 
-Stage 2 (Irreversible Runtime Init): Once fully validated, control is handed over to AndroidRuntime through thin C-ABI shims to launch ZygoteInit or RuntimeInit.
+`ZygoteRS` re-imagines the critical startup phase of Android's core application launcher (`app_process`) in **Rust**. Positioned at the very foundation of the Android Runtime (ART), `ZygoteRS` parses boot configurations, pre-configures environment states, and seamlessly hands over execution to `ZygoteInit` and `RuntimeInit` with mathematical memory safety and zero runtime panics.
 
-Zero-Panic Guarantee & Memory Safety:
+---
 
-Enforced #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)] lint rules ensure no runtime panics or panic=abort crashes during early process startup.
+## 🚀 Key Features
 
-Checked arithmetic (checked_add, checked_sub) is used for process name argument block allocation calculations, preventing buffer overflows and dangling pointer issues when setArgv0 overwrites argv[0].
+### 🛡️ Two-Stage Fallback Architecture
+Designed with a strict fail-safe strategy to ensure zero bootloops under any condition:
+* **Stage 1 (Reversible & Side-Effect Free):** Command-line arguments, environment parameters, and system properties are validated in a strictly read-only phase. Any parsing ambiguity, unexpected argument, or edge-case safely returns `APP_PROCESS_RS_DECLINED`[cite: 1, 6], seamlessly falling back to the legacy C++ execution path without mutating system state[cite: 5, 6].
+* **Stage 2 (Irreversible Runtime Init):** Once Stage 1 guarantees complete parameter validity, control is passed to `AndroidRuntime` via ultra-thin C-ABI shims[cite: 1, 6] to jump into `ZygoteInit` or `RuntimeInit`[cite: 6].
 
-Single-Threaded Fork Safety:
+### 🔒 Zero-Panic & Memory Safety
+* **No-Panic Policy:** Enforced via strict linting rules (`#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]`)[cite: 6]. Prevents early startup process crashes (`panic=abort`) entirely[cite: 6].
+* **Safe Argument Block Allocation:** Calculates process name argument block overlays (`argv[0]`) using bounds-checked arithmetic (`checked_add`, `checked_sub`)[cite: 6]. Eliminates buffer overflows and dangling pointers during `setArgv0` operations[cite: 6].
 
-Strictly avoids creating threads prior to process fork, preserving Android Zygote's core invariant that pre-fork processes remain single-threaded.
+### 🧵 Single-Threaded Pre-Fork Guarantee
+* Respects Android Zygote's primary invariant: **Strictly avoids spawning background threads prior to process fork**[cite: 6], preserving clean POSIX `fork()` behavior across all spawned Android processes.
 
-Isolated & Testable CLI Parser (args.rs):
+### 🧪 Isolated & Host-Testable CLI Parser (`args.rs`)
+* Decoupled from system C libraries and global state[cite: 7].
+* Fully testable on the host machine (`rust_test_host`) against real-world Android initialization scripts (e.g., `init.zygote64.rc`, `am`, `pm`, `--application`) prior to flashing on target devices[cite: 7].
 
-Pure Rust parsing logic isolated from C++ runtime state, allowing direct host-side unit testing (rust_test_host) against real Android boot command-line configurations (init.zygote64.rc, am, pm, etc.).
+### 🎛️ Dynamic Feature Flag & A/B Testing Control
+* Switch runtime execution engines dynamically via system property (`debug.aerolon.zygote_rs`) without rebuilding:
+  ```bash
+  # Force enable ZygoteRS path
+  adb shell su -c setprop debug.aerolon.zygote_rs 1
 
-Zero-Downtime Feature Flag Control:
-
-Dynamic toggle capability via system property (debug.aerolon.zygote_rs) and build-time configuration (APP_PROCESS_RS_DEFAULT) for seamless runtime switching and A/B testing on target devices.
+  # Force fallback to legacy C++ path
+  adb shell su -c setprop debug.aerolon.zygote_rs 0
