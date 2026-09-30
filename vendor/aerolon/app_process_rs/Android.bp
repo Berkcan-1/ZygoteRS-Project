@@ -1,0 +1,25 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Rust start-up logic for app_process (argument parsing, dalvik-cache, ABI
+// list, sequencing). Lives under vendor/ only because Soong's neverallow list
+// does not permit Rust modules under frameworks/base/. This is a plain
+// (system) static library: it is linked into the system app_process binary.
+rust_ffi_static {
+    name: "libapp_process_rs",
+    crate_name: "app_process_rs",
+    srcs: ["rs/lib.rs"],
+    edition: "2021",
+    visibility: ["//frameworks/base/cmds/app_process"],
+}
+
+// Host-side unit tests for the (pure) command line parser.
+//   atest libapp_process_rs_args_tests
+rust_test_host {
+    name: "libapp_process_rs_args_tests",
+    crate_name: "app_process_rs_args_tests",
+    srcs: ["rs/args.rs"],
+    edition: "2021",
+    test_suites: ["general-tests"],
+}
