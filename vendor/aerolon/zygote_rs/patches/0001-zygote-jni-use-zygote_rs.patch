@@ -1,0 +1,579 @@
+--- a/frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
++++ b/frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
+@@ -18,6 +18,7 @@
+ #define ATRACE_TAG ATRACE_TAG_DALVIK
+ 
+ #include "com_android_internal_os_Zygote.h"
++#include "zygote_rs.h"
+ 
+ #include <async_safe/log.h>
+ 
+@@ -154,11 +155,6 @@
+ static int gUsapPoolSocketFD = -1;
+ 
+ /**
+- * The number of USAPs currently in this Zygote's pool.
+- */
+-static std::atomic_uint32_t gUsapPoolCount = 0;
+-
+-/**
+  * Event file descriptor used to communicate reaped USAPs to the
+  * ZygoteServer.
+  */
+@@ -206,119 +202,10 @@
+ 
+ static void WaitUntilDirReady(const std::string& target, fail_fn_t fail_fn);
+ 
+-/**
+- * A helper class containing accounting information for USAPs.
+- */
+-class UsapTableEntry {
+- public:
+-  struct EntryStorage {
+-    int32_t pid;
+-    int32_t read_pipe_fd;
+-
+-    bool operator!=(const EntryStorage& other) {
+-      return pid != other.pid || read_pipe_fd != other.read_pipe_fd;
+-    }
+-  };
+-
+- private:
+-  static constexpr EntryStorage INVALID_ENTRY_VALUE = {-1, -1};
+-
+-  std::atomic<EntryStorage> mStorage;
+-  static_assert(decltype(mStorage)::is_always_lock_free);  // Accessed from signal handler.
+-
+- public:
+-  constexpr UsapTableEntry() : mStorage(INVALID_ENTRY_VALUE) {}
+-
+-  /**
+-   * If the provided PID matches the one stored in this entry, the entry will
+-   * be invalidated and the associated file descriptor will be closed.  If the
+-   * PIDs don't match nothing will happen.
+-   *
+-   * @param pid The ID of the process who's entry we want to clear.
+-   * @return True if the entry was cleared by this call; false otherwise
+-   */
+-  bool ClearForPID(int32_t pid) {
+-    EntryStorage storage = mStorage.load();
+-
+-    if (storage.pid == pid) {
+-      /*
+-       * There are three possible outcomes from this compare-and-exchange:
+-       *   1) It succeeds, in which case we close the FD
+-       *   2) It fails and the new value is INVALID_ENTRY_VALUE, in which case
+-       *      the entry has already been cleared.
+-       *   3) It fails and the new value isn't INVALID_ENTRY_VALUE, in which
+-       *      case the entry has already been cleared and re-used.
+-       *
+-       * In all three cases the goal of the caller has been met, but only in
+-       * the first case do we need to decrement the pool count.
+-       */
+-      if (mStorage.compare_exchange_strong(storage, INVALID_ENTRY_VALUE)) {
+-        close(storage.read_pipe_fd);
+-        return true;
+-      } else {
+-        return false;
+-      }
+-
+-    } else {
+-      return false;
+-    }
+-  }
+-
+-  void Clear() {
+-    EntryStorage storage = mStorage.load();
+-
+-    if (storage != INVALID_ENTRY_VALUE) {
+-      close(storage.read_pipe_fd);
+-      mStorage.store(INVALID_ENTRY_VALUE);
+-    }
+-  }
+-
+-  void Invalidate() {
+-    mStorage.store(INVALID_ENTRY_VALUE);
+-  }
+-
+-  /**
+-   * @return A copy of the data stored in this entry.
+-   */
+-  std::optional<EntryStorage> GetValues() {
+-    EntryStorage storage = mStorage.load();
+-
+-    if (storage != INVALID_ENTRY_VALUE) {
+-      return storage;
+-    } else {
+-      return std::nullopt;
+-    }
+-  }
+-
+-  /**
+-   * Sets the entry to the given values if it is currently invalid.
+-   *
+-   * @param pid  The process ID for the new entry.
+-   * @param read_pipe_fd  The read end of the USAP control pipe for this
+-   * process.
+-   * @return True if the entry was set; false otherwise.
+-   */
+-  bool SetIfInvalid(int32_t pid, int32_t read_pipe_fd) {
+-    EntryStorage new_value_storage;
+-
+-    new_value_storage.pid = pid;
+-    new_value_storage.read_pipe_fd = read_pipe_fd;
+-
+-    EntryStorage expected = INVALID_ENTRY_VALUE;
+-
+-    return mStorage.compare_exchange_strong(expected, new_value_storage);
+-  }
+-};
+-
+-/**
+- * A table containing information about the USAPs currently in the pool.
+- *
+- * Multiple threads may be attempting to modify the table, either from the
+- * signal handler or from the ZygoteServer poll loop.  Atomic loads/stores in
+- * the USAPTableEntry class prevent data races during these concurrent
+- * operations.
+- */
+-static std::array<UsapTableEntry, USAP_POOL_SIZE_MAX_LIMIT> gUsapTable;
++// The USAP accounting table (UsapTableEntry / gUsapTable / gUsapPoolCount) now lives in Rust
++// (zygote_rs, src/usap.rs). zrs_usap_remove() is async-signal-safe: it is called from
++// SigChldHandler below.
++static_assert(USAP_POOL_SIZE_MAX_LIMIT == ZRS_USAP_POOL_SIZE_MAX_LIMIT);
+ 
+ /**
+  * The list of open zygote file descriptors.
+@@ -368,6 +255,25 @@
+     } payload;
+ };
+ 
++// The decoder for this message lives in Rust (zygote_rs, src/sigchld.rs); pin the layout.
++static_assert(sizeof(UnsolicitedZygoteMessageSigChld) == ZRS_SIGCHLD_MSG_SIZE);
++static_assert(offsetof(UnsolicitedZygoteMessageSigChld, header.type) == 0);
++static_assert(offsetof(UnsolicitedZygoteMessageSigChld, payload.pid) == 4);
++static_assert(offsetof(UnsolicitedZygoteMessageSigChld, payload.uid) == 8);
++static_assert(offsetof(UnsolicitedZygoteMessageSigChld, payload.status) == 12);
++static_assert(sizeof(UnsolicitedZygoteMessageTypes) == 4);
++static_assert(UNSOLICITED_ZYGOTE_MESSAGE_TYPE_SIGCHLD == 1);
++
++// Constants duplicated in zygote_rs (src/caps.rs); fail the build if they ever drift.
++static_assert(AID_USER_OFFSET == 100000);
++static_assert(AID_BLUETOOTH == 1002);
++static_assert(AID_NETWORK_STACK == 1073);
++static_assert(AID_WAKELOCK == 3010);
++static_assert(CAP_SETGID == 6 && CAP_SETUID == 7 && CAP_SETPCAP == 8);
++static_assert(CAP_NET_BIND_SERVICE == 10 && CAP_NET_BROADCAST == 11);
++static_assert(CAP_NET_ADMIN == 12 && CAP_NET_RAW == 13 && CAP_SYS_NICE == 23);
++static_assert(CAP_WAKE_ALARM == 35 && CAP_BLOCK_SUSPEND == 36);
++
+ // Keep sync with services/core/java/com/android/server/am/ProcessList.java
+ static constexpr struct sockaddr_un kSystemServerSockAddr =
+         {.sun_family = AF_LOCAL, .sun_path = "/data/system/unsolzygotesocket"};
+@@ -530,13 +436,10 @@
+ // A nullptr argument is tolerated.
+ static void SetGids(JNIEnv* env, jintArray managed_gids, jboolean is_child_zygote,
+                     fail_fn_t fail_fn) {
++  ZrsError err;
+   if (managed_gids == nullptr) {
+-    if (is_child_zygote) {
+-      // For child zygotes like webview and app zygote, we want to clear out
+-      // any supplemental groups the parent zygote had.
+-      if (setgroups(0, NULL) == -1) {
+-        fail_fn(CREATE_ERROR("Failed to remove supplementary groups for child zygote"));
+-      }
++    if (!zrs_set_gids(nullptr, 0, /*has_gids=*/false, is_child_zygote == JNI_TRUE, &err)) {
++      fail_fn(CREATE_ERROR("%s", err.msg));
+     }
+     return;
+   }
+@@ -546,8 +449,9 @@
+     fail_fn(CREATE_ERROR("Getting gids int array failed"));
+   }
+ 
+-  if (setgroups(gids.size(), reinterpret_cast<const gid_t*>(&gids[0])) == -1) {
+-    fail_fn(CREATE_ERROR("setgroups failed: %s, gids.size=%zu", strerror(errno), gids.size()));
++  if (!zrs_set_gids(gids.get(), gids.size(), /*has_gids=*/true, is_child_zygote == JNI_TRUE,
++                    &err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+@@ -571,10 +475,11 @@
+     return;
+   }
+ 
+-  rlimit rlim;
+-  memset(&rlim, 0, sizeof(rlim));
+-
+-  for (int i = 0; i < env->GetArrayLength(managed_rlimits); ++i) {
++  // Flatten int[n][3] into int32_t[3n]; the shape is validated here, where the JNI handles are.
++  const jsize count = env->GetArrayLength(managed_rlimits);
++  std::vector<int32_t> flat;
++  flat.reserve(static_cast<size_t>(count) * 3);
++  for (jsize i = 0; i < count; ++i) {
+     ScopedLocalRef<jobject>
+         managed_rlimit_object(env, env->GetObjectArrayElement(managed_rlimits, i));
+     ScopedIntArrayRO rlimit_handle(env, reinterpret_cast<jintArray>(managed_rlimit_object.get()));
+@@ -582,14 +487,12 @@
+     if (rlimit_handle.size() != 3) {
+       fail_fn(CREATE_ERROR("rlimits array must have a second dimension of size 3"));
+     }
++    flat.insert(flat.end(), rlimit_handle.get(), rlimit_handle.get() + 3);
++  }
+ 
+-    rlim.rlim_cur = rlimit_handle[1];
+-    rlim.rlim_max = rlimit_handle[2];
+-
+-    if (setrlimit(rlimit_handle[0], &rlim) == -1) {
+-      fail_fn(CREATE_ERROR("setrlimit(%d, {%ld, %ld}) failed",
+-                           rlimit_handle[0], rlim.rlim_cur, rlim.rlim_max));
+-    }
++  ZrsError err;
++  if (!zrs_set_rlimits(flat.data(), flat.size(), &err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+@@ -652,62 +555,31 @@
+ }
+ 
+ static void EnableKeepCapabilities(fail_fn_t fail_fn) {
+-  if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1) {
+-    fail_fn(CREATE_ERROR("prctl(PR_SET_KEEPCAPS) failed: %s", strerror(errno)));
++  ZrsError err;
++  if (!zrs_keep_capabilities(&err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+ static void DropCapabilitiesBoundingSet(fail_fn_t fail_fn) {
+-  for (int i = 0; prctl(PR_CAPBSET_READ, i, 0, 0, 0) >= 0; i++) {;
+-    if (prctl(PR_CAPBSET_DROP, i, 0, 0, 0) == -1) {
+-      if (errno == EINVAL) {
+-        ALOGE("prctl(PR_CAPBSET_DROP) failed with EINVAL. Please verify "
+-              "your kernel is compiled with file capabilities support");
+-      } else {
+-        fail_fn(CREATE_ERROR("prctl(PR_CAPBSET_DROP, %d) failed: %s", i, strerror(errno)));
+-      }
+-    }
++  ZrsError err;
++  if (!zrs_drop_bounding_set(&err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+ static void SetInheritable(uint64_t inheritable, fail_fn_t fail_fn) {
+-  __user_cap_header_struct capheader;
+-  memset(&capheader, 0, sizeof(capheader));
+-  capheader.version = _LINUX_CAPABILITY_VERSION_3;
+-  capheader.pid = 0;
+-
+-  __user_cap_data_struct capdata[2];
+-  if (capget(&capheader, &capdata[0]) == -1) {
+-    fail_fn(CREATE_ERROR("capget failed: %s", strerror(errno)));
+-  }
+-
+-  capdata[0].inheritable = inheritable;
+-  capdata[1].inheritable = inheritable >> 32;
+-
+-  if (capset(&capheader, &capdata[0]) == -1) {
+-    fail_fn(CREATE_ERROR("capset(inh=%" PRIx64 ") failed: %s", inheritable, strerror(errno)));
++  ZrsError err;
++  if (!zrs_set_inheritable(inheritable, &err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+ static void SetCapabilities(uint64_t permitted, uint64_t effective, uint64_t inheritable,
+                             fail_fn_t fail_fn) {
+-  __user_cap_header_struct capheader;
+-  memset(&capheader, 0, sizeof(capheader));
+-  capheader.version = _LINUX_CAPABILITY_VERSION_3;
+-  capheader.pid = 0;
+-
+-  __user_cap_data_struct capdata[2];
+-  memset(&capdata, 0, sizeof(capdata));
+-  capdata[0].effective = effective;
+-  capdata[1].effective = effective >> 32;
+-  capdata[0].permitted = permitted;
+-  capdata[1].permitted = permitted >> 32;
+-  capdata[0].inheritable = inheritable;
+-  capdata[1].inheritable = inheritable >> 32;
+-
+-  if (capset(&capheader, &capdata[0]) == -1) {
+-    fail_fn(CREATE_ERROR("capset(perm=%" PRIx64 ", eff=%" PRIx64 ", inh=%" PRIx64 ") "
+-                         "failed: %s", permitted, effective, inheritable, strerror(errno)));
++  ZrsError err;
++  if (!zrs_set_capabilities(permitted, effective, inheritable, &err)) {
++    fail_fn(CREATE_ERROR("%s", err.msg));
+   }
+ }
+ 
+@@ -1011,11 +883,7 @@
+ }
+ 
+ static void ClearUsapTable() {
+-  for (UsapTableEntry& entry : gUsapTable) {
+-    entry.Clear();
+-  }
+-
+-  gUsapPoolCount = 0;
++  zrs_usap_clear_all();
+ }
+ 
+ // Create an app data directory over tmpfs overlayed CE / DE storage, and bind mount it
+@@ -1794,95 +1662,30 @@
+     }
+ }
+ 
+-static uint64_t GetEffectiveCapabilityMask(JNIEnv* env) {
+-    __user_cap_header_struct capheader;
+-    memset(&capheader, 0, sizeof(capheader));
+-    capheader.version = _LINUX_CAPABILITY_VERSION_3;
+-    capheader.pid = 0;
+-
+-    __user_cap_data_struct capdata[2];
+-    if (capget(&capheader, &capdata[0]) == -1) {
+-        ALOGE("capget failed: %s", strerror(errno));
+-        RuntimeAbort(env, __LINE__, "capget failed");
+-    }
+-
+-    return capdata[0].effective | (static_cast<uint64_t>(capdata[1].effective) << 32);
+-}
+ 
+ static jlong CalculateCapabilities(JNIEnv* env, jint uid, jint gid, jintArray gids,
+                                    bool is_child_zygote) {
+-  jlong capabilities = 0;
+-
+-  /*
+-   *  Grant the following capabilities to the Bluetooth user:
+-   *    - CAP_WAKE_ALARM
+-   *    - CAP_NET_ADMIN
+-   *    - CAP_NET_RAW
+-   *    - CAP_NET_BIND_SERVICE (for DHCP client functionality)
+-   *    - CAP_SYS_NICE (for setting RT priority for audio-related threads)
+-   */
+-
+-  if (multiuser_get_app_id(uid) == AID_BLUETOOTH) {
+-    capabilities |= (1LL << CAP_WAKE_ALARM);
+-    capabilities |= (1LL << CAP_NET_ADMIN);
+-    capabilities |= (1LL << CAP_NET_RAW);
+-    capabilities |= (1LL << CAP_NET_BIND_SERVICE);
+-    capabilities |= (1LL << CAP_SYS_NICE);
+-  }
+-
+-  if (multiuser_get_app_id(uid) == AID_NETWORK_STACK) {
+-    capabilities |= (1LL << CAP_NET_ADMIN);
+-    capabilities |= (1LL << CAP_NET_BROADCAST);
+-    capabilities |= (1LL << CAP_NET_BIND_SERVICE);
+-    capabilities |= (1LL << CAP_NET_RAW);
+-  }
+-
+-  /*
+-   * Grant CAP_BLOCK_SUSPEND to processes that belong to GID "wakelock"
+-   */
+-
+-  bool gid_wakelock_found = false;
+-  if (gid == AID_WAKELOCK) {
+-    gid_wakelock_found = true;
+-  } else if (gids != nullptr) {
+-    jsize gids_num = env->GetArrayLength(gids);
++  // Policy (bluetooth / network_stack / wakelock / child zygote) and the capget() mask
++  // filter live in zygote_rs, src/caps.rs.
++  ZrsError err;
++  uint64_t capabilities = 0;
++  bool ok;
++  if (gids != nullptr) {
+     ScopedIntArrayRO native_gid_proxy(env, gids);
+-
+     if (native_gid_proxy.get() == nullptr) {
+       RuntimeAbort(env, __LINE__, "Bad gids array");
+     }
+-
+-    for (int gids_index = 0; gids_index < gids_num; ++gids_index) {
+-      if (native_gid_proxy[gids_index] == AID_WAKELOCK) {
+-        gid_wakelock_found = true;
+-        break;
+-      }
+-    }
+-  }
+-
+-  if (gid_wakelock_found) {
+-    capabilities |= (1LL << CAP_BLOCK_SUSPEND);
++    ok = zrs_calculate_capabilities(uid, gid, native_gid_proxy.get(), native_gid_proxy.size(),
++                                    /*has_gids=*/true, is_child_zygote, &capabilities, &err);
++  } else {
++    ok = zrs_calculate_capabilities(uid, gid, nullptr, 0, /*has_gids=*/false, is_child_zygote,
++                                    &capabilities, &err);
+   }
+-
+-  /*
+-   * Grant child Zygote processes the following capabilities:
+-   *   - CAP_SETUID (change UID of child processes)
+-   *   - CAP_SETGID (change GID of child processes)
+-   *   - CAP_SETPCAP (change capabilities of child processes)
+-   */
+-
+-  if (is_child_zygote) {
+-    capabilities |= (1LL << CAP_SETUID);
+-    capabilities |= (1LL << CAP_SETGID);
+-    capabilities |= (1LL << CAP_SETPCAP);
++  if (!ok) {
++    ALOGE("%s", err.msg);
++    RuntimeAbort(env, __LINE__, "capget failed");
+   }
+-
+-  /*
+-   * Containers run without some capabilities, so drop any caps that are not
+-   * available.
+-   */
+-
+-  return capabilities & GetEffectiveCapabilityMask(env);
++  return static_cast<jlong>(capabilities);
+ }
+ 
+ /**
+@@ -1895,25 +1698,11 @@
+  * specialization.
+  */
+ static void AddUsapTableEntry(pid_t usap_pid, int read_pipe_fd) {
+-  static int sUsapTableInsertIndex = 0;
+-
+-  int search_index = sUsapTableInsertIndex;
+-  do {
+-    if (gUsapTable[search_index].SetIfInvalid(usap_pid, read_pipe_fd)) {
+-      ++gUsapPoolCount;
+-
+-      // Start our next search right after where we finished this one.
+-      sUsapTableInsertIndex = (search_index + 1) % gUsapTable.size();
+-
+-      return;
+-    }
+-
+-    search_index = (search_index + 1) % gUsapTable.size();
+-  } while (search_index != sUsapTableInsertIndex);
+-
+-  // Much like money in the banana stand, there should always be an entry
+-  // in the USAP table.
+-  __builtin_unreachable();
++  if (!zrs_usap_add(usap_pid, read_pipe_fd)) {
++    // The C++ table hit __builtin_unreachable() (UB) here. Pool size is capped by Java well
++    // below the table size, so this is a bug elsewhere; make it visible instead of undefined.
++    ALOGE("USAP table is full, pid %d will not be tracked", usap_pid);
++  }
+ }
+ 
+ /**
+@@ -1925,32 +1714,16 @@
+  * @return True if an entry was invalidated; false otherwise
+  */
+ static bool RemoveUsapTableEntry(pid_t usap_pid) {
+-  for (UsapTableEntry& entry : gUsapTable) {
+-    if (entry.ClearForPID(usap_pid)) {
+-      --gUsapPoolCount;
+-      return true;
+-    }
+-  }
+-
+-  return false;
++  return zrs_usap_remove(usap_pid);  // async-signal-safe
+ }
+ 
+ /**
+  * @return A vector of the read pipe FDs for each of the active USAPs.
+  */
+ std::vector<int> MakeUsapPipeReadFDVector() {
+-  std::vector<int> fd_vec;
+-  fd_vec.reserve(gUsapTable.size());
+-
+-  for (UsapTableEntry& entry : gUsapTable) {
+-    auto entry_values = entry.GetValues();
+-
+-    if (entry_values.has_value()) {
+-      fd_vec.push_back(entry_values.value().read_pipe_fd);
+-    }
+-  }
+-
+-  return fd_vec;
++  int32_t fds[ZRS_USAP_POOL_SIZE_MAX_LIMIT];
++  const size_t n = zrs_usap_read_fds(fds, ZRS_USAP_POOL_SIZE_MAX_LIMIT);
++  return std::vector<int>(fds, fds + n);
+ }
+ 
+ static void UnmountStorageOnInit(JNIEnv* env) {
+@@ -2475,7 +2248,7 @@
+  * @return The number of USAPs currently in the USAP pool
+  */
+ static jint com_android_internal_os_Zygote_nativeGetUsapPoolCount(JNIEnv* env, jclass) {
+-  return gUsapPoolCount;
++  return static_cast<jint>(zrs_usap_count());
+ }
+ 
+ /**
+@@ -2485,24 +2258,7 @@
+  * @param env  Managed runtime environment
+  */
+ static void com_android_internal_os_Zygote_nativeEmptyUsapPool(JNIEnv* env, jclass) {
+-  for (auto& entry : gUsapTable) {
+-    auto entry_storage = entry.GetValues();
+-
+-    if (entry_storage.has_value()) {
+-      kill(entry_storage.value().pid, SIGTERM);
+-
+-      // Clean up the USAP table entry here.  This avoids a potential race
+-      // where a newly created USAP might not be able to find a valid table
+-      // entry if signal handler (which would normally do the cleanup) doesn't
+-      // run between now and when the new process is created.
+-
+-      close(entry_storage.value().read_pipe_fd);
+-
+-      // Avoid a second atomic load by invalidating instead of clearing.
+-      entry.Invalidate();
+-      --gUsapPoolCount;
+-    }
+-  }
++  zrs_usap_empty_pool();
+ }
+ 
+ static void com_android_internal_os_Zygote_nativeBlockSigTerm(JNIEnv* env, jclass) {
+@@ -2536,25 +2292,22 @@
+         jniThrowException(env, "java/lang/IllegalArgumentException", nullptr);
+         return -1;
+     }
+-    const struct UnsolicitedZygoteMessageSigChld* msg =
+-            reinterpret_cast<const struct UnsolicitedZygoteMessageSigChld*>(source.get());
+ 
+-    switch (msg->header.type) {
+-        case UNSOLICITED_ZYGOTE_MESSAGE_TYPE_SIGCHLD: {
+-            ScopedIntArrayRW buf(env, out);
+-            if (buf.size() != 3) {
+-                jniThrowException(env, "java/lang/IllegalArgumentException", nullptr);
+-                return UNSOLICITED_ZYGOTE_MESSAGE_TYPE_RESERVED;
+-            }
+-            buf[0] = msg->payload.pid;
+-            buf[1] = msg->payload.uid;
+-            buf[2] = msg->payload.status;
+-            return 3;
+-        }
+-        default:
+-            break;
++    // Decoding (type check + field extraction) is done in Rust.
++    int32_t parsed[3];
++    if (zrs_parse_sigchld(reinterpret_cast<const uint8_t*>(source.get()), length, parsed) != 3) {
++        return -1;
++    }
++
++    ScopedIntArrayRW buf(env, out);
++    if (buf.size() != 3) {
++        jniThrowException(env, "java/lang/IllegalArgumentException", nullptr);
++        return UNSOLICITED_ZYGOTE_MESSAGE_TYPE_RESERVED;
+     }
+-    return -1;
++    buf[0] = parsed[0];
++    buf[1] = parsed[1];
++    buf[2] = parsed[2];
++    return 3;
+ }
+ 
+ static jboolean com_android_internal_os_Zygote_nativeSupportsMemoryTagging(JNIEnv* env, jclass) {

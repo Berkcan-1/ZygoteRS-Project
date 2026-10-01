@@ -1,0 +1,511 @@
+--- a/frameworks/base/core/jni/com_android_internal_os_ZygoteCommandBuffer.cpp
++++ b/frameworks/base/core/jni/com_android_internal_os_ZygoteCommandBuffer.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "com_android_internal_os_Zygote.h"
++#include "zygote_rs.h"
+ 
+ #include <algorithm>
+ #include <android-base/logging.h>
+@@ -28,329 +29,87 @@
+ #include <nativehelper/JNIHelp.h>
+ #include <optional>
+ #include <poll.h>
++#include <string>
+ #include <unistd.h>
+ #include <utility>
+ #include <utils/misc.h>
+ #include <sys/mman.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+-#include <sys/system_properties.h>
+ #include <vector>
+ 
+ namespace android {
+ 
+-using namespace std::placeholders;
+ using android::base::StringPrintf;
+ using android::zygote::ZygoteFailure;
+ 
+ // WARNING: Knows a little about the wire protocol used to communicate with Zygote.
++//
++// The command buffer itself (line reader, argument counting, the "simple fork command"
++// classifier) now lives in Rust: zygote_rs, src/cmdbuf.rs. This file keeps only the JNI
++// marshalling and nativeForkRepeatedly(), which owns fork()/poll()/accept() and therefore
++// stays in C++ for now.
+ 
+-// Commands and nice names have large arbitrary size limits to avoid dynamic memory allocation.
+-constexpr size_t MAX_COMMAND_BYTES = 32768;
+-constexpr size_t NICE_NAME_BYTES = 128;
+-
+-// A buffer optionally bundled with a file descriptor from which we can fill it.
+-// Does not own the file descriptor; destroying a NativeCommandBuffer does not
+-// close the descriptor.
+-class NativeCommandBuffer {
+- public:
+-  NativeCommandBuffer(int sourceFd): mEnd(0), mNext(0), mLinesLeft(0), mFd(sourceFd) {}
+-
+-  // Read mNext line from mFd, filling mBuffer from file descriptor, as needed.
+-  // Return a pair of pointers pointing to the first character, and one past the
+-  // mEnd of the line, i.e. at the newline. Returns nothing on failure.
+-  template<class FailFn>
+-  std::optional<std::pair<char*, char*>> readLine(FailFn fail_fn) {
+-    char* result = mBuffer + mNext;
+-    while (true) {
+-      if (mNext == mEnd) {
+-        if (mEnd == MAX_COMMAND_BYTES) {
+-          return {};
+-        }
+-        if (mFd == -1) {
+-          fail_fn("ZygoteCommandBuffer.readLine attempted to read from mFd -1");
+-        }
+-        ssize_t nread = TEMP_FAILURE_RETRY(read(mFd, mBuffer + mEnd, MAX_COMMAND_BYTES - mEnd));
+-        if (nread <= 0) {
+-          if (nread == 0) {
+-            return {};
+-          }
+-          fail_fn(CREATE_ERROR("session socket read failed: %s", strerror(errno)));
+-        } else if (nread == MAX_COMMAND_BYTES - mEnd) {
+-          // This is pessimistic by one character, but close enough.
+-          fail_fn("ZygoteCommandBuffer overflowed: command too long");
+-        }
+-        mEnd += nread;
+-      }
+-      // UTF-8 does not allow newline to occur as part of a multibyte character.
+-      char* nl = static_cast<char *>(memchr(mBuffer + mNext, '\n', mEnd - mNext));
+-      if (nl == nullptr) {
+-        mNext = mEnd;
+-      } else {
+-        mNext = nl - mBuffer + 1;
+-        if (--mLinesLeft < 0) {
+-          fail_fn("ZygoteCommandBuffer.readLine attempted to read past mEnd of command");
+-        }
+-        return std::make_pair(result, nl);
+-      }
+-    }
+-  }
+-
+-  void reset() {
+-    mNext = 0;
+-  }
+-
+-  // Make sure the current command is fully buffered, without reading past the current command.
+-  template<class FailFn>
+-  void readAllLines(FailFn fail_fn) {
+-     while (mLinesLeft > 0) {
+-       readLine(fail_fn);
+-    }
+-  }
+-
+-  void clear() {
+-    // Don't bother to actually clear the buffer; it'll be unmapped in the child anyway.
+-    reset();
+-    mNiceName[0] = '\0';
+-    mEnd = 0;
+-  }
+-
+-  // Insert line into the mBuffer. Checks that the mBuffer is not associated with an mFd.
+-  // Implicitly adds newline separators. Allows mBuffer contents to be explicitly set.
+-  void insert(const char* line, size_t lineLen) {
+-    DCHECK(mFd == -1);
+-    CHECK(mEnd + lineLen < MAX_COMMAND_BYTES);
+-    strncpy(mBuffer + mEnd, line, lineLen);
+-    mBuffer[mEnd + lineLen] = '\n';
+-    mEnd += lineLen + 1;
+-  }
+-
+-  // Clear mBuffer, start reading new command, return the number of arguments, leaving mBuffer
+-  // positioned at the beginning of first argument. Return 0 on EOF.
+-  template<class FailFn>
+-  int getCount(FailFn fail_fn) {
+-    mLinesLeft = 1;
+-    auto line = readLine(fail_fn);
+-    if (!line.has_value()) {
+-      return 0;
+-    }
+-    char* countString = line.value().first;  // Newline terminated.
+-    long nArgs = atol(countString);
+-    if (nArgs <= 0 || nArgs >= MAX_COMMAND_BYTES / 2) {
+-      fail_fn(CREATE_ERROR("Unreasonable argument count %ld", nArgs));
+-    }
+-    mLinesLeft = nArgs;
+-    return static_cast<int>(nArgs);
+-  }
+-
+-  // Is the mBuffer a simple fork command?
+-  // We disallow request to wrap the child process, child zygotes, anything that
+-  // mentions capabilities or requests uid < minUid.
+-  // We insist that --setuid and --setgid arguments are explicitly included and that the
+-  // command starts with --runtime-args.
+-  // Assumes we are positioned at the beginning of the command after the argument count,
+-  // and leaves the position at some indeterminate position in the buffer.
+-  // As a side effect, this sets mNiceName to a non-empty string, if possible.
+-  template<class FailFn>
+-  bool isSimpleForkCommand(int minUid, FailFn fail_fn) {
+-    if (mLinesLeft <= 0 || mLinesLeft  >= MAX_COMMAND_BYTES / 2) {
+-      return false;
+-    }
+-    static const char* RUNTIME_ARGS = "--runtime-args";
+-    static const char* INVOKE_WITH = "--invoke-with";
+-    static const char* CHILD_ZYGOTE = "--start-child-zygote";
+-    static const char* SETUID = "--setuid=";
+-    static const char* SETGID = "--setgid=";
+-    static const char* CAPABILITIES = "--capabilities";
+-    static const char* NICE_NAME = "--nice-name=";
+-    static const size_t RA_LENGTH = strlen(RUNTIME_ARGS);
+-    static const size_t IW_LENGTH = strlen(INVOKE_WITH);
+-    static const size_t CZ_LENGTH = strlen(CHILD_ZYGOTE);
+-    static const size_t SU_LENGTH = strlen(SETUID);
+-    static const size_t SG_LENGTH = strlen(SETGID);
+-    static const size_t CA_LENGTH = strlen(CAPABILITIES);
+-    static const size_t NN_LENGTH = strlen(NICE_NAME);
+-
+-    bool saw_setuid = false, saw_setgid = false;
+-    bool saw_runtime_args = false;
+-
+-    while (mLinesLeft > 0) {
+-      auto read_result = readLine(fail_fn);
+-      if (!read_result.has_value()) {
+-        return false;
+-      }
+-      auto [arg_start, arg_end] = read_result.value();
+-      if (arg_end - arg_start == RA_LENGTH
+-          && strncmp(arg_start, RUNTIME_ARGS, RA_LENGTH) == 0) {
+-        saw_runtime_args = true;
+-        continue;
+-      }
+-      if (arg_end - arg_start >= NN_LENGTH
+-          && strncmp(arg_start, NICE_NAME, NN_LENGTH) == 0) {
+-        size_t name_len = arg_end - (arg_start + NN_LENGTH);
+-        size_t copy_len = std::min(name_len, NICE_NAME_BYTES - 1);
+-        memcpy(mNiceName, arg_start + NN_LENGTH, copy_len);
+-        mNiceName[copy_len] = '\0';
+-        if (haveWrapProperty()) {
+-          return false;
+-        }
+-        continue;
+-      }
+-      if (arg_end - arg_start == IW_LENGTH
+-          && strncmp(arg_start, INVOKE_WITH, IW_LENGTH) == 0) {
+-        // This also removes the need for invoke-with security checks here.
+-        return false;
+-      }
+-      if (arg_end - arg_start == CZ_LENGTH
+-          && strncmp(arg_start, CHILD_ZYGOTE, CZ_LENGTH) == 0) {
+-        return false;
+-      }
+-      if (arg_end - arg_start >= CA_LENGTH
+-          && strncmp(arg_start, CAPABILITIES, CA_LENGTH) == 0) {
+-        return false;
+-      }
+-      if (arg_end - arg_start >= SU_LENGTH
+-          && strncmp(arg_start, SETUID, SU_LENGTH) == 0) {
+-        int uid = digitsVal(arg_start + SU_LENGTH, arg_end);
+-        if (uid < minUid) {
+-          return false;
+-        }
+-        saw_setuid = true;
+-        continue;
+-      }
+-      if (arg_end - arg_start >= SG_LENGTH
+-          && strncmp(arg_start, SETGID, SG_LENGTH) == 0) {
+-        int gid = digitsVal(arg_start + SG_LENGTH, arg_end);
+-        if (gid == -1) {
+-          return false;
+-        }
+-        saw_setgid = true;
+-      }
+-      // ro.debuggable can be handled entirely in the child unless --invoke-with is also specified.
+-      // Thus we do not need to check it here.
+-    }
+-    return saw_runtime_args && saw_setuid && saw_setgid;
+-  }
+-
+-  void setFd(int new_fd) {
+-    mFd = new_fd;
+-  }
+-
+-  int getFd() const {
+-    return mFd;
+-  }
+-
+-  const char* niceNameAddr() const {
+-    return mNiceName;
+-  }
+-
+-  // Debug only:
+-  void logState() const {
+-    ALOGD("mbuffer starts with %c%c, nice name is %s, "
+-          "mEnd = %u, mNext = %u, mLinesLeft = %d, mFd = %d",
+-          mBuffer[0], (mBuffer[1] == '\n' ? ' ' : mBuffer[1]),
+-          niceNameAddr(),
+-          static_cast<unsigned>(mEnd), static_cast<unsigned>(mNext),
+-          static_cast<int>(mLinesLeft), mFd);
+-  }
+-
+- private:
+-  bool haveWrapProperty() {
+-    static const char* WRAP = "wrap.";
+-    static const size_t WRAP_LENGTH = strlen(WRAP);
+-    char propNameBuf[WRAP_LENGTH + NICE_NAME_BYTES];
+-    strcpy(propNameBuf, WRAP);
+-    strlcpy(propNameBuf + WRAP_LENGTH, mNiceName, NICE_NAME_BYTES);
+-    return __system_property_find(propNameBuf) != nullptr;
+-  }
+-  // Picky version of atoi(). No sign or unexpected characters allowed. Return -1 on failure.
+-  static int digitsVal(char* start, char* end) {
+-    int result = 0;
+-    if (end - start > 6) {
+-      return -1;
+-    }
+-    for (char* dp = start; dp < end; ++dp) {
+-      if (*dp < '0' || *dp > '9') {
+-        ALOGW("Argument failed integer format check");
+-        return -1;
+-      }
+-      result = 10 * result + (*dp - '0');
+-    }
+-    return result;
+-  }
+-
+-  uint32_t mEnd;  // Index of first empty byte in the mBuffer.
+-  uint32_t mNext;  // Index of first character past last line returned by readLine.
+-  int32_t mLinesLeft;  // Lines in current command that haven't yet been read.
+-  int mFd;  // Open file descriptor from which we can read more. -1 if none.
+-  char mNiceName[NICE_NAME_BYTES];  // Always null terminated.
+-  char mBuffer[MAX_COMMAND_BYTES];
+-};
+-
+-static int buffersAllocd(0);
++static inline ZrsCmdBuf* AsBuf(jlong j_buffer) {
++  return reinterpret_cast<ZrsCmdBuf*>(j_buffer);
++}
+ 
+-// Get a new NativeCommandBuffer. Can only be called once between freeNativeBuffer calls,
+-// so that only one buffer exists at a time.
++// Get a new command buffer. Can only be called once between freeNativeBuffer calls,
++// so that only one buffer exists at a time (enforced in Rust).
+ jlong com_android_internal_os_ZygoteCommandBuffer_getNativeBuffer(JNIEnv* env, jclass, jint fd) {
+-  CHECK(buffersAllocd == 0);
+-  ++buffersAllocd;
+-  // MMap explicitly to get it page aligned.
+-  void *bufferMem = mmap(NULL, sizeof(NativeCommandBuffer), PROT_READ | PROT_WRITE,
+-                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+-  // Currently we mmap and unmap one for every request handled by the Java code.
+-  // That could be improved, but unclear it matters.
+-  if (bufferMem == MAP_FAILED) {
++  ZrsCmdBuf* buffer = zrs_cmdbuf_new(fd);
++  if (buffer == nullptr) {
+     ZygoteFailure(env, nullptr, nullptr, "Failed to map argument buffer");
+   }
+-  return (jlong) new(bufferMem) NativeCommandBuffer(fd);
++  return reinterpret_cast<jlong>(buffer);
+ }
+ 
+ // Delete native command buffer.
+ void com_android_internal_os_ZygoteCommandBuffer_freeNativeBuffer(JNIEnv* env, jclass,
+                                                                   jlong j_buffer) {
+-  CHECK(buffersAllocd == 1);
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+-  n_buffer->~NativeCommandBuffer();
+-  if (munmap(n_buffer, sizeof(NativeCommandBuffer)) != 0) {
++  if (!zrs_cmdbuf_free(AsBuf(j_buffer))) {
+     ZygoteFailure(env, nullptr, nullptr, "Failed to unmap argument buffer");
+   }
+-  --buffersAllocd;
+ }
+ 
+ // Clear the buffer, read the line containing the count, and return the count.
+ jint com_android_internal_os_ZygoteCommandBuffer_nativeGetCount(JNIEnv* env, jclass,
+                                                                 jlong j_buffer) {
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+-  auto fail_fn = std::bind(ZygoteFailure, env, nullptr, nullptr, _1);
+-  return n_buffer->getCount(fail_fn);
++  ZrsError err;
++  int32_t count = 0;
++  if (!zrs_cmdbuf_get_count(AsBuf(j_buffer), &count, &err)) {
++    ZygoteFailure(env, nullptr, nullptr, err.msg);
++  }
++  return count;
+ }
+ 
+ // Explicitly insert a string as the last line (argument) of the buffer.
+ void com_android_internal_os_ZygoteCommandBuffer_insert(JNIEnv* env, jclass, jlong j_buffer,
+                                                         jstring line) {
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+   size_t lineLen = static_cast<size_t>(env->GetStringUTFLength(line));
+   const char* cstring = env->GetStringUTFChars(line, NULL);
+-  n_buffer->insert(cstring, lineLen);
++  ZrsError err;
++  bool ok = zrs_cmdbuf_insert(AsBuf(j_buffer), reinterpret_cast<const uint8_t*>(cstring), lineLen,
++                              &err);
+   env->ReleaseStringUTFChars(line, cstring);
++  if (!ok) {
++    ZygoteFailure(env, nullptr, nullptr, err.msg);
++  }
+ }
+ 
+ // Read a line from the buffer, refilling as necessary.
+ jstring com_android_internal_os_ZygoteCommandBuffer_nativeNextArg(JNIEnv* env, jclass,
+                                                                   jlong j_buffer) {
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+-  auto fail_fn = std::bind(ZygoteFailure, env, n_buffer->niceNameAddr(), nullptr, _1);
+-  auto line = n_buffer->readLine(fail_fn);
+-  if (!line.has_value()) {
+-    fail_fn("Incomplete zygote command");
+-  }
+-  auto [cresult, endp] = line.value();
+-  // OK to temporarily clobber the buffer, since this is not thread safe, and we're modifying
+-  // the buffer anyway.
+-  *endp = '\0';
+-  jstring result = env->NewStringUTF(cresult);
+-  *endp = '\n';
+-  return result;
++  ZrsCmdBuf* buffer = AsBuf(j_buffer);
++  const char* arg = nullptr;
++  size_t arg_len = 0;
++  ZrsError err;
++  if (!zrs_cmdbuf_next_arg(buffer, &arg, &arg_len, &err)) {
++    ZygoteFailure(env, zrs_cmdbuf_nice_name(buffer), nullptr, err.msg);
++  }
++  // The line is not NUL terminated inside the buffer; copy it out (args are short).
++  std::string copy(arg, arg_len);
++  return env->NewStringUTF(copy.c_str());
+ }
+ 
+ // Read all lines from the current command into the buffer, and then reset the buffer, so
+@@ -358,10 +117,11 @@
+ // count. And we don't need access to the fd to do so.
+ void com_android_internal_os_ZygoteCommandBuffer_nativeReadFullyAndReset(JNIEnv* env, jclass,
+                                                                          jlong j_buffer) {
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+-  auto fail_fn = std::bind(ZygoteFailure, env, n_buffer->niceNameAddr(), nullptr, _1);
+-  n_buffer->readAllLines(fail_fn);
+-  n_buffer->reset();
++  ZrsCmdBuf* buffer = AsBuf(j_buffer);
++  ZrsError err;
++  if (!zrs_cmdbuf_read_fully_and_reset(buffer, &err)) {
++    ZygoteFailure(env, zrs_cmdbuf_nice_name(buffer), nullptr, err.msg);
++  }
+ }
+ 
+ // Fork a child as specified by the current command buffer, and refill the command
+@@ -387,15 +147,24 @@
+             jstring managed_nice_name) {
+ 
+   ALOGI("Entering forkRepeatedly native zygote loop");
+-  NativeCommandBuffer* n_buffer = reinterpret_cast<NativeCommandBuffer*>(j_buffer);
+-  int session_socket = n_buffer->getFd();
++  ZrsCmdBuf* n_buffer = AsBuf(j_buffer);
++  int session_socket = zrs_cmdbuf_fd(n_buffer);
+   std::vector<int> session_socket_fds {session_socket};
+-  auto fail_fn_1 = std::bind(ZygoteFailure, env, static_cast<const char*>(nullptr),
+-                             static_cast<jstring>(managed_nice_name), _1);
+-  // This binds to the nice name address; the actual names are updated by isSimpleForkCommand:
+-  auto fail_fn_n = std::bind(ZygoteFailure, env, n_buffer->niceNameAddr(),
+-                             static_cast<jstring>(nullptr), _1);
+-  auto fail_fn_z = std::bind(ZygoteFailure, env, "zygote", nullptr, _1);
++
++  // Failure reporters. The original used three std::bind objects; a flag keeps this one type.
++  //  - first_time == true : name comes from the Java-side nice name (only known then)
++  //  - first_time == false: name is read from the buffer *at failure time*, because
++  //    is_simple_fork updates it for every new command (the original bound its address).
++  auto fail_buf = [&](bool first_time, const std::string& msg) {
++    if (first_time) {
++      ZygoteFailure(env, static_cast<const char*>(nullptr), managed_nice_name, msg);
++    } else {
++      ZygoteFailure(env, zrs_cmdbuf_nice_name(n_buffer), static_cast<jstring>(nullptr), msg);
++    }
++  };
++  auto fail_fn_z = [&](const std::string& msg) {
++    ZygoteFailure(env, "zygote", nullptr, msg);
++  };
+ 
+   struct pollfd fd_structs[2];
+   static const int ZYGOTE_IDX = 0;
+@@ -413,10 +182,10 @@
+ 
+   struct ucred credentials;
+   socklen_t cred_size = sizeof credentials;
+-  if (getsockopt(n_buffer->getFd(), SOL_SOCKET, SO_PEERCRED, &credentials, &cred_size) == -1
++  if (getsockopt(zrs_cmdbuf_fd(n_buffer), SOL_SOCKET, SO_PEERCRED, &credentials, &cred_size) == -1
+       || cred_size != sizeof credentials) {
+-    fail_fn_1(CREATE_ERROR("ForkRepeatedly failed to get initial credentials, %s",
+-                           strerror(errno)));
++    fail_buf(true, CREATE_ERROR("ForkRepeatedly failed to get initial credentials, %s",
++                                strerror(errno)));
+   }
+ 
+   bool first_time = true;
+@@ -424,8 +193,12 @@
+     if (credentials.uid != expected_uid) {
+       return JNI_FALSE;
+     }
+-    n_buffer->readAllLines(first_time ? fail_fn_1 : fail_fn_n);
+-    n_buffer->reset();
++    {
++      ZrsError err;
++      if (!zrs_cmdbuf_read_fully_and_reset(n_buffer, &err)) {
++        fail_buf(first_time, err.msg);
++      }
++    }
+     int pid = zygote::forkApp(env, /* no pipe FDs */ -1, -1, session_socket_fds,
+                               /*args_known=*/ true, /*is_priority_fork=*/ true,
+                               /*purge=*/ first_time);
+@@ -443,20 +216,23 @@
+     int res = TEMP_FAILURE_RETRY(write(session_socket, pid_buf, 5));
+     if (res != 5) {
+       if (res == -1) {
+-        (first_time ? fail_fn_1 : fail_fn_n)
+-            (CREATE_ERROR("Pid write error %d: %s", errno, strerror(errno)));
++        fail_buf(first_time, CREATE_ERROR("Pid write error %d: %s", errno, strerror(errno)));
+       } else {
+-        (first_time ? fail_fn_1 : fail_fn_n)
+-            (CREATE_ERROR("Write unexpectedly returned short: %d < 5", res));
++        fail_buf(first_time, CREATE_ERROR("Write unexpectedly returned short: %d < 5", res));
+       }
+     }
+     // Clear buffer and get count from next command.
+-    n_buffer->clear();
++    zrs_cmdbuf_clear(n_buffer);
+     for (;;) {
+       // Poll isn't strictly necessary for now. But without it, disconnect is hard to detect.
+       int poll_res = TEMP_FAILURE_RETRY(poll(fd_structs, 2, -1 /* infinite timeout */));
+       if ((fd_structs[SESSION_IDX].revents & POLLIN) != 0) {
+-        if (n_buffer->getCount(fail_fn_z) != 0) {
++        ZrsError err;
++        int32_t count = 0;
++        if (!zrs_cmdbuf_get_count(n_buffer, &count, &err)) {
++          fail_fn_z(err.msg);
++        }
++        if (count != 0) {
+           break;
+         }  // else disconnected;
+       } else if (poll_res == 0 || (fd_structs[ZYGOTE_IDX].revents & POLLIN) == 0) {
+@@ -497,10 +273,22 @@
+       }
+     }
+     first_time = false;
+-  } while (n_buffer->isSimpleForkCommand(minUid, fail_fn_n));
++
++    // Is the next command another simple fork command? (Also refreshes the nice name.)
++    bool simple = false;
++    {
++      ZrsError err;
++      if (!zrs_cmdbuf_is_simple_fork(n_buffer, minUid, &simple, &err)) {
++        fail_buf(false, err.msg);
++      }
++    }
++    if (!simple) {
++      break;
++    }
++  } while (true);
+   ALOGW("forkRepeatedly terminated due to non-simple command");
+-  n_buffer->logState();
+-  n_buffer->reset();
++  zrs_cmdbuf_log_state(n_buffer);
++  zrs_cmdbuf_reset(n_buffer);
+   return JNI_FALSE;
+ }
+ 

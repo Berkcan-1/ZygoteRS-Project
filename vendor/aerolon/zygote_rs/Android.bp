@@ -1,0 +1,34 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Rust leaf logic of Zygote's JNI layer (USAP table, command buffer, capabilities, SIGCHLD
+// message). Lives under vendor/ only because Soong's neverallow list does not permit Rust
+// modules under frameworks/base/. Plain (system) static library: it is linked into
+// libandroid_runtime. Do NOT add vendor:true / proprietary:true here.
+// C ABI header: frameworks/base/core/jni/zygote_rs.h
+rust_defaults {
+    name: "zygote_rs_defaults",
+    crate_name: "zygote_rs",
+    srcs: ["rs/lib.rs"],
+    edition: "2021",
+    rustlibs: ["liblibc"],
+}
+
+rust_ffi_static {
+    name: "libzygote_rs",
+    defaults: ["zygote_rs_defaults"],
+    shared_libs: ["liblog"], // __android_log_write
+    visibility: ["//frameworks/base/core/jni"],
+}
+
+// Host unit tests:  atest zygote_rs_host_test   (or `cargo test`)
+rust_test_host {
+    name: "zygote_rs_host_test",
+    defaults: ["zygote_rs_defaults"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    test_options: {
+        unit_test: true,
+    },
+}

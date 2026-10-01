@@ -1,0 +1,16 @@
+# Convenience for running the unit tests on a dev machine (`cargo test`).
+# The device build uses Android.bp, not this file.
+[package]
+name = "zygote_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "rs/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
