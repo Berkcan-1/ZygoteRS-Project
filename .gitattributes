@@ -1,0 +1,3 @@
+frameworks/base/**/*.cpp linguist-vendored
+frameworks/base/**/*.h linguist-vendored
+frameworks/base/**/*.hls linguist-vendored
